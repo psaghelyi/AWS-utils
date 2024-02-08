@@ -20,8 +20,8 @@ def set_aws_credentials(profile, region_name='us-east-1'):
     return session
 
 
-def current_timestamp() -> int:
-    return int(time.time() * 1000)
+def now() -> int:
+    return int(time.time())
 
 
 def hours_ago(hours) -> int:
@@ -30,6 +30,10 @@ def hours_ago(hours) -> int:
 
 def days_ago(days) -> int:
     return int(time.time() - 60 * 60 * 24 * days)
+
+
+def exact_date(year, month, day) -> int:
+    return int(time.mktime((year, month, day, 0, 0, 0, 0, 0, 0)))
 
 
 def execute_query(logs_client, log_group, query, start_time, end_time):
@@ -62,7 +66,7 @@ def get_query_results(logs_client, query_id):
     return response['results'], int(response['statistics']['recordsScanned']), int(response['statistics']['recordsMatched'])
 
 
-def cloudwatch_query(logs_client, log_group, query, start_time=current_timestamp(), end_time=hours_ago(1)):
+def cloudwatch_query(logs_client, log_group, query, start_time=hours_ago(1), end_time=now()):
     query_id = execute_query(logs_client, log_group, query, start_time, end_time)
     wait_for_query(logs_client, query_id)
     response, records_scanned, records_matched = get_query_results(logs_client, query_id)
