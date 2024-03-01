@@ -1,0 +1,4 @@
+botocore
+boto3
+aws_error_utils
+pandas
