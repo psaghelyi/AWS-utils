@@ -2,3 +2,9 @@ botocore
 boto3
 aws_error_utils
 pandas
+websocket-client
+prettytable
+construct
+matplotlib
+tabulate
+openpyxl
