@@ -164,7 +164,7 @@ def cloudwatch_crawler(logs_client, log_group, base_query, start_date, end_date,
                 if isinstance(result, int):
                     print(f"Slice {slice_num}: More than 10000 records found. Splitting the time slice.")
                     # Recursively fetch the further pieces
-                    slices = result // 10000 + int(result * 0.1 / 10000)  # add 10% buffer to the slice count
+                    slices = int(result * 1.1) // 10000 + 1  # add 10% buffer
                     cloudwatch_crawler(logs_client, log_group, base_query, start_ts, end_ts, folder_name, slices=slices)
                 else:
                     # print the number of log entries in each time slice
