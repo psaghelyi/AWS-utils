@@ -1,12 +1,17 @@
-import boto3
-import subprocess
 import json
+import os
+import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from botocore.exceptions import ClientError
+import boto3
+import pytz
 
 
 def set_aws_credentials(profile, region_name='us-east-1'):
     result = subprocess.run(
-        f"aws-vault exec {profile} --json", shell=True, capture_output=True)
+        f"aws-vault exec {profile} --json", shell=True, capture_output=True, check=True)
     credentials = json.loads(result.stdout)
 
     # Create a session with the retrieved credentials
@@ -32,8 +37,8 @@ def days_ago(days) -> int:
     return int(time.time() - 60 * 60 * 24 * days)
 
 
-def exact_date(year, month, day) -> int:
-    return int(time.mktime((year, month, day, 0, 0, 0, 0, 0, 0)))
+def exact_date(year, month, day, hour = 0, minute = 0, second = 0) -> int:
+    return int(time.mktime((year, month, day, hour, minute, second, 0, 0, 0)))
 
 
 def execute_query(logs_client, log_group, query, start_time, end_time):
@@ -44,6 +49,7 @@ def execute_query(logs_client, log_group, query, start_time, end_time):
         queryString=query,
     )
     return response['queryId']
+
 
 def wait_for_query(logs_client, query_id):
     done = False
@@ -67,18 +73,111 @@ def get_query_results(logs_client, query_id):
 
 
 def cloudwatch_query(logs_client, log_group, query, start_time=hours_ago(1), end_time=now()):
+    """
+    Execute a CloudWatch Logs Insights query and return the results.
+    This function executes a query against CloudWatch Logs, waits for completion,
+    and returns either the flattened results or the count of matched records if
+    the result set is too large (>=10000 records).
+    Args:
+        logs_client: boto3 CloudWatch Logs client
+        log_group (str): The name of the log group to query
+        query (str): The query string to execute
+        start_time (int): Start time for the query in milliseconds since epoch (default: 1 hour ago)
+        end_time (int): End time for the query in milliseconds since epoch (default: current time)
+    Returns:
+        Union[list[dict], int]: If records_matched < 10000, returns a list of dictionaries where each
+                               dictionary represents a log entry with field-value pairs.
+                               If records_matched >= 10000, returns the number of matched records.
+    Example:
+        >>> logs_client = boto3.client('logs')
+        >>> results = cloudwatch_query(logs_client, '/aws/lambda/my-function',
+                                     'fields @timestamp, @message | sort @timestamp desc')
+    """
     query_id = execute_query(logs_client, log_group, query, start_time, end_time)
     wait_for_query(logs_client, query_id)
     response, records_scanned, records_matched = get_query_results(logs_client, query_id)
     print (f'records_scanned: {records_scanned}')
     print (f'records_matched: {records_matched}')
 
+    if records_matched >= 10000:
+        return records_matched
+    
     # Flatten the data
     data = []
     for entry in response:
         row = {item['field']: item['value'] for item in entry}
         data.append(row)
     return data
+
+
+def cloudwatch_crawler(logs_client, log_group, base_query, start_date, end_date, folder_name, slices=1):
+    """
+    Fetches log entries from CloudWatch Logs by splitting the time range into slices and querying in parallel.
+    This function splits a given time range into smaller slices and queries CloudWatch Logs for each slice
+    in parallel using a ThreadPoolExecutor. If a slice returns more than 10,000 records (the CloudWatch Logs limit),
+    it recursively splits that slice into smaller pieces.
+    Args:
+        logs_client: Boto3 CloudWatch Logs client
+        log_group (str): Name of the CloudWatch Logs log group to query
+        base_query (str): Base query string to execute against CloudWatch Logs
+        start_date (int): Start timestamp in epoch seconds
+        end_date (int): End timestamp in epoch seconds
+        folder_name (str): Name of folder where result files will be saved
+        slices (int, optional): Number of time slices to split the query into. Defaults to 1.
+    Returns:
+        None: Results are written to JSON files in the specified folder
+    Files are saved in the format: ./{folder_name}/{folder_name}_{start_timestamp}.json
+    Note:
+        - Maximum 10 concurrent queries are executed in parallel
+        - Each query has a limit of 10,000 records
+        - If a file for a time slice already exists, that slice is skipped
+        - If a slice returns more than 10K records, it's automatically split into smaller slices
+    """
+    slice_duration = (end_date - start_date) / slices
+    query = base_query + " | limit 10000"
+
+    future_to_task = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for i in range(slices):
+            # Calculate the start and end timestamps for the current time slice
+            start_timestamp = int(start_date + (i * slice_duration))
+            end_timestamp = int(start_date + ((i + 1) * slice_duration))
+        
+            # print time slice in human readable format (original format is epoch time in seconds)
+            print(f"Time slice {i}: {datetime.fromtimestamp(start_timestamp, tz=pytz.timezone('UTC'))} - {datetime.fromtimestamp(end_timestamp, tz=pytz.timezone('UTC'))}")
+
+            # create filename with slice number
+            filename = f'./{folder_name}/{folder_name}_{start_timestamp}.json'
+
+            # skip file if it already exists
+            if os.path.exists(filename):
+                print(f"File {filename} already exists. Skipping.")
+                continue
+
+            future_to_task.append((executor.submit(
+                cloudwatch_query, logs_client, log_group, query, start_timestamp, end_timestamp), i, filename, start_timestamp, end_timestamp))
+            
+        for future, slice_num, filename, start_ts, end_ts in future_to_task:
+            try:
+                result = future.result()
+                # if result contains more than 10K records, the returning type is integer
+                if isinstance(result, int):
+                    print(f"Slice {slice_num}: More than 10000 records found. Splitting the time slice.")
+                    # Recursively fetch the further pieces
+                    slices = result // 10000 + int(result * 0.1 / 10000)  # add 10% buffer to the slice count
+                    cloudwatch_crawler(logs_client, log_group, base_query, start_ts, end_ts, folder_name, slices=slices)
+                else:
+                    # print the number of log entries in each time slice
+                    print(f"Slice {slice_num}: Number of log entries: {len(result)}")
+                    # write results to file
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(json.dumps(result))
+                        f.write('\n')
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'AccessDeniedException':
+                    print("Session expired")
+                else:
+                    print("Unexpected error: %s" % e)
 
 
 def parse_json_messages(data):
